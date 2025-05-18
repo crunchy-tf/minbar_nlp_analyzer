@@ -7,7 +7,7 @@ from typing import List, Optional
 import sys
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-import numpy as np # Import numpy for checking array type
+import numpy as np # Import numpy
 
 from app.models import (
     NLPAnalysisRequest, NLPAnalysisResponse, SentimentScore, 
@@ -32,13 +32,13 @@ scheduler = AsyncIOScheduler()
 @app.on_event("startup")
 async def startup_event():
     logger.info("NLP Analyzer Service starting up...")
-    get_sentiment_analyzer_instance() # Initializes SentimentAnalyzer and its model
-    tm_instance = get_topic_modeler_instance() # Initializes TopicModeler (which loads SBERT & BERTopic)
+    get_sentiment_analyzer_instance() 
+    tm_instance = get_topic_modeler_instance() 
     if not tm_instance.topic_model:
         logger.critical(f"BERTopic model at {BERTOPIC_MODEL_PATH} could not be loaded or its embedding model is missing. Topic modeling in /analyze will be skipped or fail.")
     elif tm_instance.topic_model and not tm_instance.topic_model.embedding_model:
          logger.critical(f"BERTopic model at {BERTOPIC_MODEL_PATH} loaded, but its internal SBERT embedding_model is missing. Topic modeling in /analyze will fail.")
-    get_keyword_extractor_instance() # Initializes KeywordExtractor
+    get_keyword_extractor_instance() 
     
     scheduler.add_job(
         log_heartbeat,
@@ -76,50 +76,59 @@ async def analyze_text(
     # 1. Zero-Shot Sentiment Analysis on the whole cleaned_text
     overall_sentiment_scores_raw = sentiment_analyzer.analyze(request_data.cleaned_text)
     overall_sentiment_scores = [SentimentScore(**s) for s in overall_sentiment_scores_raw] if overall_sentiment_scores_raw else []
-    if not overall_sentiment_scores_raw and request_data.cleaned_text.strip(): # If text not empty but no scores
+    if not overall_sentiment_scores_raw and request_data.cleaned_text.strip():
         errors.append("Overall sentiment analysis failed or returned no result.")
 
 
     # 2. Topic Modeling
     assigned_doc_topics: List[TopicInfo] = []
 
-    if topic_modeler.topic_model and topic_modeler.topic_model.embedding_model: # Ensure model and its embedder are ready
-        topic_result = topic_modeler.get_topics_for_doc(request_data.cleaned_text) # This calls .transform()
+    if topic_modeler.topic_model and topic_modeler.topic_model.embedding_model:
+        topic_result = topic_modeler.get_topics_for_doc(request_data.cleaned_text) 
         
         if topic_result:
-            # .transform() typically returns:
-            # pred_topic_ids: List of topic ids (e.g., [15] for one doc)
-            # pred_topic_probs: NumPy array of probabilities for these assigned topics (e.g., array([0.852])) OR None
-            pred_topic_ids, pred_topic_probs = topic_result
+            pred_topic_ids, pred_topic_probs_distributions = topic_result
 
-            for i, topic_id in enumerate(pred_topic_ids):
+            # For a single input document like [doc_text] to BERTopic's transform,
+            # pred_topic_ids is a list like [assigned_topic_id_for_doc_0]
+            # pred_topic_probs_distributions is a list containing one numpy array:
+            #   [array_of_all_topic_probs_for_doc_0]
+            # or it could be just the single probability for the assigned topic if not full distribution.
+            
+            for i, topic_id in enumerate(pred_topic_ids): # i will typically be 0 for single doc processing
                 topic_keywords_scores = topic_modeler.get_topic_details(topic_id) or []
                 topic_name_str = topic_modeler.get_topic_name(topic_id)
                 
                 current_doc_probability: Optional[float] = None
-                # Check if pred_topic_probs is not None and is a numpy array or list, and i is a valid index
-                if pred_topic_probs is not None and \
-                   (isinstance(pred_topic_probs, (np.ndarray, list))) and \
-                   i < len(pred_topic_probs):
+                if pred_topic_probs_distributions is not None and \
+                   i < len(pred_topic_probs_distributions) and \
+                   pred_topic_probs_distributions[i] is not None:
+                    
+                    prob_data_for_doc = pred_topic_probs_distributions[i]
+                    
                     try:
-                        # Directly access the probability for the i-th document's assigned topic
-                        prob_value = pred_topic_probs[i]
-                        current_doc_probability = float(prob_value)
+                        if isinstance(prob_data_for_doc, np.ndarray) and prob_data_for_doc.ndim > 0 :
+                            # If it's an array, it's likely the full distribution for this document.
+                            # The assigned topic_id is the one with the max probability.
+                            current_doc_probability = float(np.max(prob_data_for_doc))
+                            logger.debug(f"Extracted max probability {current_doc_probability} from distribution for topic {topic_id}")
+                        elif isinstance(prob_data_for_doc, (float, int, np.floating, np.integer)):
+                            # If it's already a scalar, BERTopic returned the single highest probability.
+                            current_doc_probability = float(prob_data_for_doc)
+                            logger.debug(f"Using direct probability {current_doc_probability} for topic {topic_id}")
+                        else:
+                            logger.warning(f"Unexpected type for probability data for doc index {i}, topic {topic_id}. Type: {type(prob_data_for_doc)}. Value: {prob_data_for_doc}")
                     except (TypeError, ValueError) as e_prob:
-                        logger.warning(f"Could not convert probability to float for doc index {i}, topic {topic_id}. Value: {pred_topic_probs[i]}. Error: {e_prob}")
-                elif pred_topic_probs is not None:
-                    logger.warning(f"pred_topic_probs is not a suitable array/list or index i is out of bounds. Type: {type(pred_topic_probs)}, Length: {len(pred_topic_probs) if hasattr(pred_topic_probs, '__len__') else 'N/A'}")
-
+                        logger.warning(f"Could not convert probability to float for doc index {i}, topic {topic_id}. Prob data: {prob_data_for_doc}. Error: {e_prob}")
                 
                 assigned_doc_topics.append(TopicInfo(
-                    id=int(topic_id), # Ensure topic_id is int for Pydantic model
+                    id=int(topic_id),
                     name=topic_name_str,
                     keywords=topic_keywords_scores,
                     probability=current_doc_probability
                 ))
-        elif request_data.cleaned_text.strip(): # If text not empty but topic_result is None
+        elif request_data.cleaned_text.strip():
             errors.append("Topic modeling (transform) returned no result for non-empty text.")
-        # If topic_result is None and text was empty, get_topics_for_doc handles it.
             
     else:
         if not topic_modeler.topic_model:
@@ -160,7 +169,6 @@ async def analyze_text(
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting NLP Analyzer Service for local development...")
-    # Ensure SBERT_MODEL_NAME is in config for TopicModeler
     from app.config import SBERT_MODEL_NAME 
     if not SBERT_MODEL_NAME:
         logger.error("SBERT_MODEL_NAME not found in app.config.py! TopicModeler may fail.")
