@@ -1,3 +1,4 @@
+# FILE: app/main.py
 # FastAPI app, routes, scheduler
 from fastapi import FastAPI, HTTPException, Depends
 from loguru import logger
@@ -6,10 +7,11 @@ from typing import List, Optional
 import sys
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+import numpy as np # Import numpy for checking array type
 
 from app.models import (
     NLPAnalysisRequest, NLPAnalysisResponse, SentimentScore, 
-    TopicInfo, KeywordFrequency # ExtractedTopicAnalysis removed
+    TopicInfo, KeywordFrequency
 )
 from app.config import LOG_LEVEL, SCHEDULER_JOB_INTERVAL_SECONDS, BERTOPIC_MODEL_PATH
 from app.nlp_tasks.sentiment_analyzer import get_sentiment_analyzer_instance, SentimentAnalyzer
@@ -30,11 +32,13 @@ scheduler = AsyncIOScheduler()
 @app.on_event("startup")
 async def startup_event():
     logger.info("NLP Analyzer Service starting up...")
-    get_sentiment_analyzer_instance()
-    tm_instance = get_topic_modeler_instance()
+    get_sentiment_analyzer_instance() # Initializes SentimentAnalyzer and its model
+    tm_instance = get_topic_modeler_instance() # Initializes TopicModeler (which loads SBERT & BERTopic)
     if not tm_instance.topic_model:
-        logger.critical(f"BERTopic model at {BERTOPIC_MODEL_PATH} could not be loaded. Service might not function correctly.")
-    get_keyword_extractor_instance()
+        logger.critical(f"BERTopic model at {BERTOPIC_MODEL_PATH} could not be loaded or its embedding model is missing. Topic modeling in /analyze will be skipped or fail.")
+    elif tm_instance.topic_model and not tm_instance.topic_model.embedding_model:
+         logger.critical(f"BERTopic model at {BERTOPIC_MODEL_PATH} loaded, but its internal SBERT embedding_model is missing. Topic modeling in /analyze will fail.")
+    get_keyword_extractor_instance() # Initializes KeywordExtractor
     
     scheduler.add_job(
         log_heartbeat,
@@ -72,36 +76,56 @@ async def analyze_text(
     # 1. Zero-Shot Sentiment Analysis on the whole cleaned_text
     overall_sentiment_scores_raw = sentiment_analyzer.analyze(request_data.cleaned_text)
     overall_sentiment_scores = [SentimentScore(**s) for s in overall_sentiment_scores_raw] if overall_sentiment_scores_raw else []
-    if not overall_sentiment_scores_raw and request_data.cleaned_text.strip():
+    if not overall_sentiment_scores_raw and request_data.cleaned_text.strip(): # If text not empty but no scores
         errors.append("Overall sentiment analysis failed or returned no result.")
 
 
     # 2. Topic Modeling
     assigned_doc_topics: List[TopicInfo] = []
-    # analyzed_topics_sentiments_list REMOVED
 
-    if topic_modeler.topic_model:
-        topic_result = topic_modeler.get_topics_for_doc(request_data.cleaned_text)
+    if topic_modeler.topic_model and topic_modeler.topic_model.embedding_model: # Ensure model and its embedder are ready
+        topic_result = topic_modeler.get_topics_for_doc(request_data.cleaned_text) # This calls .transform()
+        
         if topic_result:
-            doc_topic_ids, doc_topic_probs = topic_result
-            for i, topic_id in enumerate(doc_topic_ids):
+            # .transform() typically returns:
+            # pred_topic_ids: List of topic ids (e.g., [15] for one doc)
+            # pred_topic_probs: NumPy array of probabilities for these assigned topics (e.g., array([0.852])) OR None
+            pred_topic_ids, pred_topic_probs = topic_result
+
+            for i, topic_id in enumerate(pred_topic_ids):
                 topic_keywords_scores = topic_modeler.get_topic_details(topic_id) or []
                 topic_name_str = topic_modeler.get_topic_name(topic_id)
-                prob = doc_topic_probs[i] if doc_topic_probs and i < len(doc_topic_probs) else None
+                
+                current_doc_probability: Optional[float] = None
+                # Check if pred_topic_probs is not None and is a numpy array or list, and i is a valid index
+                if pred_topic_probs is not None and \
+                   (isinstance(pred_topic_probs, (np.ndarray, list))) and \
+                   i < len(pred_topic_probs):
+                    try:
+                        # Directly access the probability for the i-th document's assigned topic
+                        prob_value = pred_topic_probs[i]
+                        current_doc_probability = float(prob_value)
+                    except (TypeError, ValueError) as e_prob:
+                        logger.warning(f"Could not convert probability to float for doc index {i}, topic {topic_id}. Value: {pred_topic_probs[i]}. Error: {e_prob}")
+                elif pred_topic_probs is not None:
+                    logger.warning(f"pred_topic_probs is not a suitable array/list or index i is out of bounds. Type: {type(pred_topic_probs)}, Length: {len(pred_topic_probs) if hasattr(pred_topic_probs, '__len__') else 'N/A'}")
+
                 
                 assigned_doc_topics.append(TopicInfo(
-                    id=topic_id,
+                    id=int(topic_id), # Ensure topic_id is int for Pydantic model
                     name=topic_name_str,
                     keywords=topic_keywords_scores,
-                    probability=prob
+                    probability=current_doc_probability
                 ))
-                
-                # --- SECTION FOR TOPIC-SPECIFIC SENTIMENT REMOVED ---
-
-        else:
-            errors.append("Topic modeling failed to return results.")
+        elif request_data.cleaned_text.strip(): # If text not empty but topic_result is None
+            errors.append("Topic modeling (transform) returned no result for non-empty text.")
+        # If topic_result is None and text was empty, get_topics_for_doc handles it.
+            
     else:
-        errors.append("BERTopic model is not loaded, skipping topic modeling.")
+        if not topic_modeler.topic_model:
+            errors.append("BERTopic model is not loaded, skipping topic modeling.")
+        elif not topic_modeler.topic_model.embedding_model:
+            errors.append("BERTopic model is loaded, but its SBERT embedding_model is missing. Skipping topic modeling.")
 
 
     # 3. Keyword Extraction (Frequency-based on preprocessed lemmas/tokens)
@@ -128,7 +152,6 @@ async def analyze_text(
         detected_language=request_data.detected_language,
         overall_sentiment=overall_sentiment_scores,
         assigned_topics=assigned_doc_topics,
-        # analyzed_topics_sentiment field REMOVED from response
         extracted_keywords_frequency=extracted_keywords_freq,
         sentiment_on_extracted_keywords_summary=sentiment_on_keywords_summary,
         analysis_errors=errors if errors else None
@@ -137,4 +160,8 @@ async def analyze_text(
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting NLP Analyzer Service for local development...")
+    # Ensure SBERT_MODEL_NAME is in config for TopicModeler
+    from app.config import SBERT_MODEL_NAME 
+    if not SBERT_MODEL_NAME:
+        logger.error("SBERT_MODEL_NAME not found in app.config.py! TopicModeler may fail.")
     uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
