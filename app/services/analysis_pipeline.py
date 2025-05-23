@@ -7,7 +7,6 @@ from app.models import (
     NLPAnalysisRequest, NLPAnalysisResponse, SentimentScore, 
     TopicInfo, KeywordFrequency
 )
-# Import the actual analyzer classes, not just the getter functions
 from app.nlp_tasks.sentiment_analyzer import SentimentAnalyzer
 from app.nlp_tasks.topic_modeler import TopicModeler
 from app.nlp_tasks.keyword_extractor import KeywordExtractor
@@ -49,7 +48,6 @@ async def execute_nlp_pipeline(
                             current_doc_probability = float(np.max(prob_data_for_doc))
                         elif isinstance(prob_data_for_doc, (float, int, np.floating, np.integer)):
                             current_doc_probability = float(prob_data_for_doc)
-                        # else: logger.warning for unexpected type already in TopicModeler
                     except (TypeError, ValueError) as e_prob:
                         logger.warning(f"Pipeline: Could not convert probability for topic {topic_id_val}, data: {prob_data_for_doc}. Error: {e_prob}")
                 assigned_doc_topics.append(TopicInfo(
@@ -60,7 +58,7 @@ async def execute_nlp_pipeline(
     else:
         if not topic_modeler.topic_model:
             errors.append("BERTopic model is not loaded, skipping topic modeling.")
-        elif topic_modeler.topic_model and not topic_modeler.topic_model.embedding_model: # Check added
+        elif topic_modeler.topic_model and not topic_modeler.topic_model.embedding_model:
             errors.append("BERTopic model is loaded, but its SBERT embedding_model is missing. Skipping topic modeling.")
 
     # 3. Keyword Extraction
@@ -70,11 +68,11 @@ async def execute_nlp_pipeline(
 
     sentiment_on_keywords_summary: Optional[List[SentimentScore]] = None
     if extracted_keywords_freq:
-        top_overall_keywords_text = " ".join([kf.keyword for kf in extracted_keywords_freq[:keyword_extractor.top_n]]) # Use keyword_extractor.top_n
+        top_overall_keywords_text = " ".join([kf.keyword for kf in extracted_keywords_freq[:keyword_extractor.top_n]])
         if top_overall_keywords_text.strip():
             kw_summary_sentiment_raw = sentiment_analyzer.analyze(top_overall_keywords_text)
             sentiment_on_keywords_summary = [SentimentScore(**s) for s in kw_summary_sentiment_raw] if kw_summary_sentiment_raw else []
-
+    
     return NLPAnalysisResponse(
         raw_mongo_id=request_data.raw_mongo_id,
         source=request_data.source,
