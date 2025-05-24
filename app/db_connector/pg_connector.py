@@ -2,10 +2,10 @@
 import asyncpg
 from typing import List, Dict, Any, Optional
 from loguru import logger
-from datetime import datetime, timezone # Import timezone
-import json # For storing JSONB data
+from datetime import datetime, timezone
+import json
 
-from app.config import settings # Use the new Pydantic settings
+from app.config import settings
 from app.models import NLPAnalysisResponse
 
 _pool: Optional[asyncpg.Pool] = None
@@ -24,11 +24,10 @@ async def connect_db():
     logger.info(f"Connecting to PostgreSQL database via DSN derived from target settings: {settings.postgres_dsn_asyncpg}")
     try:
         _pool = await asyncpg.create_pool(
-            dsn=settings.postgres_dsn_asyncpg, # This DSN points to TARGET_POSTGRES_DB
+            dsn=settings.postgres_dsn_asyncpg,
             min_size=2,
             max_size=10
         )
-        # Both source and target tables are in the same DB for Option 2
         await ensure_status_field_in_source_table()
         await create_target_nlp_results_table_if_not_exists()
         logger.success("PostgreSQL connection pool established and tables checked/prepared.")
@@ -53,7 +52,7 @@ async def get_pool() -> asyncpg.Pool:
     if _pool is None or getattr(_pool, '_closed', True):
         logger.warning("PostgreSQL pool is None or closed. Attempting to (re)initialize...")
         await connect_db()
-    if _pool is None: # Check again after attempt
+    if _pool is None:
         raise ConnectionError("PostgreSQL pool unavailable after re-initialization attempt.")
     return _pool
 
@@ -63,9 +62,7 @@ async def ensure_status_field_in_source_table():
 
     pool = await get_pool()
     field_name = settings.NLP_ANALYZER_STATUS_FIELD_IN_SOURCE
-    table_name = settings.SOURCE_POSTGRES_TABLE # This is 'processed_documents'
-    # This check/alter happens on the DB specified by settings.postgres_dsn_asyncpg
-    # which should be minbar_processed_data
+    table_name = settings.SOURCE_POSTGRES_TABLE
     logger.info(f"Ensuring status field '{field_name}' exists in source table '{table_name}' in DB '{settings.SOURCE_POSTGRES_DB}'...")
     try:
         async with pool.acquire() as conn:
@@ -79,13 +76,15 @@ async def ensure_status_field_in_source_table():
                 logger.info(f"Field '{field_name}' not found in '{table_name}'. Attempting to add it.")
                 await conn.execute(f"""
                     ALTER TABLE {table_name}
-                    ADD COLUMN IF NOT EXISTS {field_name} VARCHAR(20) DEFAULT 'pending',
+                    ADD COLUMN IF NOT EXISTS {field_name} VARCHAR(50) DEFAULT 'pending',
                     ADD COLUMN IF NOT EXISTS {field_name}_timestamp TIMESTAMPTZ;
                 """)
+                # Sanitize index name: replace non-alphanumeric except underscore
+                safe_field_name_for_idx = "".join(c if c.isalnum() else "_" for c in field_name)
                 await conn.execute(f"""
-                    CREATE INDEX IF NOT EXISTS idx_{table_name}_{field_name.replace("_","-")}
+                    CREATE INDEX IF NOT EXISTS idx_{table_name}_{safe_field_name_for_idx}
                     ON {table_name} ({field_name});
-                """) # Ensure index name is valid
+                """)
                 logger.success(f"Field '{field_name}' and timestamp added to '{table_name}'.")
             else:
                 logger.debug(f"Field '{field_name}' already exists in '{table_name}'.")
@@ -100,18 +99,17 @@ async def create_target_nlp_results_table_if_not_exists():
     if _target_table_created_and_checked: return
 
     pool = await get_pool()
-    table_name = settings.TARGET_POSTGRES_TABLE # This is 'document_nlp_outputs'
-    # This table is created in the DB specified by settings.postgres_dsn_asyncpg
-    # which should be minbar_processed_data
+    table_name = settings.TARGET_POSTGRES_TABLE
     logger.info(f"Checking/Creating target NLP results table '{table_name}' in DB '{settings.TARGET_POSTGRES_DB}'...")
     create_table_sql = f"""
     CREATE TABLE IF NOT EXISTS {table_name} (
         id SERIAL PRIMARY KEY,
-        -- processed_document_pg_id INTEGER REFERENCES {settings.SOURCE_POSTGRES_TABLE}(id) ON DELETE CASCADE, -- Optional FK
-        raw_mongo_id VARCHAR(24) NOT NULL UNIQUE, -- From NLPAnalysisResponse
+        raw_mongo_id VARCHAR(24) NOT NULL UNIQUE,
         source TEXT,
         original_timestamp TIMESTAMPTZ,
         retrieved_by_keyword TEXT,
+        keyword_concept_id VARCHAR(24),
+        original_keyword_language CHAR(2),
         processing_timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
         detected_language CHAR(2),
         overall_sentiment JSONB,
@@ -120,13 +118,14 @@ async def create_target_nlp_results_table_if_not_exists():
         sentiment_on_extracted_keywords_summary JSONB,
         analysis_errors TEXT,
         nlp_model_version VARCHAR(100),
-        signal_extraction_status VARCHAR(20) DEFAULT 'pending',
-        signal_extraction_timestamp TIMESTAMPTZ
+        signal_extraction_status VARCHAR(50) DEFAULT 'pending', -- For SES
+        signal_extraction_timestamp TIMESTAMPTZ              -- For SES
     );
     CREATE INDEX IF NOT EXISTS idx_nlp_doc_out_raw_mongo_id ON {table_name}(raw_mongo_id);
     CREATE INDEX IF NOT EXISTS idx_nlp_doc_out_orig_ts ON {table_name}(original_timestamp);
     CREATE INDEX IF NOT EXISTS idx_nlp_doc_out_sig_ext_status ON {table_name}(signal_extraction_status, original_timestamp);
     CREATE INDEX IF NOT EXISTS idx_nlp_doc_out_topics ON {table_name} USING GIN (assigned_topics);
+    CREATE INDEX IF NOT EXISTS idx_nlp_doc_out_kw_concept_id ON {table_name}(keyword_concept_id); -- Optional index
     """
     try:
         async with pool.acquire() as conn:
@@ -140,13 +139,14 @@ async def create_target_nlp_results_table_if_not_exists():
 
 async def fetch_preprocessed_docs_for_nlp(limit: int) -> List[Dict[str, Any]]:
     pool = await get_pool()
-    # This queries the SOURCE table (processed_documents)
     query = f"""
-        SELECT id, raw_mongo_id, source, original_timestamp, retrieved_by_keyword, keyword_language,
+        SELECT id, raw_mongo_id, source, original_timestamp, retrieved_by_keyword, 
+               keyword_language, keyword_concept_id, -- <<< UPDATED to include keyword_concept_id
                detected_language, cleaned_text, tokens_processed, lemmas, original_url
         FROM {settings.SOURCE_POSTGRES_TABLE}
         WHERE {settings.NLP_ANALYZER_STATUS_FIELD_IN_SOURCE} IS DISTINCT FROM 'completed' AND
-              {settings.NLP_ANALYZER_STATUS_FIELD_IN_SOURCE} IS DISTINCT FROM 'failed_permanent' 
+              {settings.NLP_ANALYZER_STATUS_FIELD_IN_SOURCE} IS DISTINCT FROM 'failed_permanent' AND
+              {settings.NLP_ANALYZER_STATUS_FIELD_IN_SOURCE} IS DISTINCT FROM 'failed_nlp_analysis' -- Avoid retrying already failed ones by this service
         ORDER BY original_timestamp ASC
         LIMIT $1;
     """
@@ -159,38 +159,38 @@ async def fetch_preprocessed_docs_for_nlp(limit: int) -> List[Dict[str, Any]]:
         return []
 
 async def mark_docs_as_nlp_processed_in_source(
-    doc_pg_ids: List[int], # Use primary key 'id' from source_postgres_table
+    doc_pg_ids: List[int],
     status: str = 'completed'
 ) -> int:
     if not settings.MARK_AS_NLP_PROCESSED_IN_SOURCE_DB or not doc_pg_ids:
         if not doc_pg_ids: logger.debug("No source document IDs to mark for NLP status.")
         return 0
-        
+
     pool = await get_pool()
+    status_field_name = settings.NLP_ANALYZER_STATUS_FIELD_IN_SOURCE
+    timestamp_field_name = f"{status_field_name}_timestamp"
+
     update_query = f"""
         UPDATE {settings.SOURCE_POSTGRES_TABLE}
-        SET 
-            {settings.NLP_ANALYZER_STATUS_FIELD_IN_SOURCE} = $1,
-            {settings.NLP_ANALYZER_STATUS_FIELD_IN_SOURCE}_timestamp = $2
+        SET
+            {status_field_name} = $1,
+            {timestamp_field_name} = $2
         WHERE id = ANY($3::int[]);
     """
     try:
-        # Ensure doc_pg_ids are actually integers
         valid_doc_pg_ids = [int(id_val) for id_val in doc_pg_ids if id_val is not None]
         if not valid_doc_pg_ids:
             logger.warning("No valid integer document IDs provided for marking NLP status.")
             return 0
 
         result_status_str = await pool.execute(update_query, status, datetime.now(timezone.utc), valid_doc_pg_ids)
-        # Format of result_status_str is typically "UPDATE N"
         updated_count = 0
         if result_status_str and result_status_str.startswith("UPDATE "):
             try:
                 updated_count = int(result_status_str.split(" ")[1])
             except (IndexError, ValueError):
                 logger.warning(f"Could not parse update count from status: {result_status_str}")
-                # Assume all were attempted if no error, or rely on actual modified count if available from driver
-                updated_count = len(valid_doc_pg_ids) # Fallback assumption
+                updated_count = len(valid_doc_pg_ids)
 
         logger.info(f"Marked {updated_count} documents as NLP '{status}' in source table '{settings.SOURCE_POSTGRES_TABLE}'.")
         return updated_count
@@ -202,38 +202,45 @@ async def store_nlp_analysis_results(results: List[NLPAnalysisResponse]) -> int:
     if not results:
         return 0
     pool = await get_pool()
-    
+
     data_to_insert = []
     for res in results:
-        # Ensure all JSONB fields are properly json.dumps'd
         data_to_insert.append((
             res.raw_mongo_id,
             res.source,
             res.original_timestamp,
             res.retrieved_by_keyword,
+            res.keyword_concept_id,
+            res.original_keyword_language,
             res.processing_timestamp,
             res.detected_language,
             json.dumps([s.model_dump() for s in res.overall_sentiment]) if res.overall_sentiment else None,
-            json.dumps([t.model_dump(exclude_none=True) for t in res.assigned_topics]) if res.assigned_topics else None, # Exclude None probabilities
+            json.dumps([t.model_dump(exclude_none=True) for t in res.assigned_topics]) if res.assigned_topics else None,
             json.dumps([kf.model_dump() for kf in res.extracted_keywords_frequency]) if res.extracted_keywords_frequency else None,
             json.dumps([s.model_dump() for s in res.sentiment_on_extracted_keywords_summary]) if res.sentiment_on_extracted_keywords_summary else None,
             json.dumps(res.analysis_errors) if res.analysis_errors else None,
-            "BERTopic_SBERT_XLM-R_v1" # Example model version string
+            "BERTopic_SBERT_XLM-R_v1" # Example
         ))
 
+    # Ensure column list matches the order and count of fields in data_to_insert
+    columns = [
+        "raw_mongo_id", "source", "original_timestamp", "retrieved_by_keyword",
+        "keyword_concept_id", "original_keyword_language",
+        "processing_timestamp", "detected_language", "overall_sentiment",
+        "assigned_topics", "extracted_keywords_frequency",
+        "sentiment_on_extracted_keywords_summary", "analysis_errors", "nlp_model_version"
+    ]
+    placeholders = ", ".join([f"${i+1}" for i in range(len(columns))])
+
     insert_query = f"""
-        INSERT INTO {settings.TARGET_POSTGRES_TABLE} (
-            raw_mongo_id, source, original_timestamp, retrieved_by_keyword, processing_timestamp,
-            detected_language, overall_sentiment, assigned_topics, extracted_keywords_frequency,
-            sentiment_on_extracted_keywords_summary, analysis_errors, nlp_model_version
-            -- signal_extraction_status is defaulted to 'pending' by table DDL
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-        )
-        ON CONFLICT (raw_mongo_id) DO UPDATE SET 
+        INSERT INTO {settings.TARGET_POSTGRES_TABLE} ({", ".join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT (raw_mongo_id) DO UPDATE SET
             source = EXCLUDED.source,
             original_timestamp = EXCLUDED.original_timestamp,
             retrieved_by_keyword = EXCLUDED.retrieved_by_keyword,
+            keyword_concept_id = EXCLUDED.keyword_concept_id,
+            original_keyword_language = EXCLUDED.original_keyword_language,
             processing_timestamp = EXCLUDED.processing_timestamp,
             detected_language = EXCLUDED.detected_language,
             overall_sentiment = EXCLUDED.overall_sentiment,
@@ -242,13 +249,13 @@ async def store_nlp_analysis_results(results: List[NLPAnalysisResponse]) -> int:
             sentiment_on_extracted_keywords_summary = EXCLUDED.sentiment_on_extracted_keywords_summary,
             analysis_errors = EXCLUDED.analysis_errors,
             nlp_model_version = EXCLUDED.nlp_model_version,
-            signal_extraction_status = 'pending', -- Reset for Signal Extraction on re-analysis
+            signal_extraction_status = 'pending',
             signal_extraction_timestamp = NULL;
     """
     try:
         async with pool.acquire() as conn:
             status_command = await conn.executemany(insert_query, data_to_insert)
-            inserted_count = len(data_to_insert) # Assume all were attempted
+            inserted_count = len(data_to_insert)
             logger.info(f"Stored/Updated {inserted_count} NLP analysis results in '{settings.TARGET_POSTGRES_TABLE}'. Status: {status_command}")
             return inserted_count
     except Exception as e:
