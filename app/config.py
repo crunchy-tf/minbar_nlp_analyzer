@@ -1,10 +1,11 @@
 # nlp_analyzer_service/app/config.py
 import os
+import logging # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< MAKE SURE THIS LINE IS HERE, AT THE VERY TOP
 from typing import List, Union, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator, model_validator
 import json
-from loguru import logger
+from loguru import logger as loguru_logger # Renamed to avoid conflict
 
 class Settings(BaseSettings):
     SERVICE_NAME: str = "Minbar NLP Analyzer Service"
@@ -17,8 +18,6 @@ class Settings(BaseSettings):
     
     BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     
-    # Give BERTOPIC_MODEL_PATH a default string value. It will be overridden by the model_validator.
-    # This satisfies Pydantic's initial validation that a 'str' field has a string-like value.
     BERTOPIC_MODEL_PATH: str = Field(default="dummy_path_will_be_overridden") 
 
     HEALTHCARE_SENTIMENT_LABELS: List[str] = [
@@ -52,11 +51,9 @@ class Settings(BaseSettings):
     def derive_bertopic_model_path(cls, model: 'Settings') -> 'Settings':
         if model.BASE_DIR and model.BERTOPIC_MODEL_FILENAME:
             derived_path = os.path.join(model.BASE_DIR, model.BERTOPIC_MODEL_FILENAME)
-            model.BERTOPIC_MODEL_PATH = derived_path # Overwrite the dummy default
+            model.BERTOPIC_MODEL_PATH = derived_path 
         else:
-            # This case should ideally not happen if BASE_DIR and FILENAME have defaults
-            logger.error("Could not derive BERTOPIC_MODEL_PATH because BASE_DIR or BERTOPIC_MODEL_FILENAME is missing/empty.")
-            # If it must be a string, and derivation fails, ensure it's still a string
+            loguru_logger.error("Could not derive BERTOPIC_MODEL_PATH because BASE_DIR or BERTOPIC_MODEL_FILENAME is missing/empty.")
             model.BERTOPIC_MODEL_PATH = "derivation_failed_path" 
         return model
 
@@ -91,25 +88,30 @@ settings = Settings()
 
 # --- Logging Setup ---
 _log_level_to_use = settings.LOG_LEVEL.upper()
+_is_loguru_configured = False
+final_logger = None # Initialize to avoid potential NameError if both try/except fail
+
 try:
-    logger.remove() 
+    loguru_logger.remove() 
     log_format = (
         "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
         "<level>{level: <8}</level> | "
         "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
     )
-    logger.add(lambda msg: print(msg, end=""), format=log_format, level=_log_level_to_use, colorize=True)
-    _is_loguru = True
-except Exception: 
-    import logging
+    loguru_logger.add(lambda msg: print(msg, end=""), format=log_format, level=_log_level_to_use, colorize=True)
+    _is_loguru_configured = True
+    final_logger = loguru_logger # Use Loguru's logger
+except Exception as e_loguru: 
+    logging.warning(f"Loguru setup failed: {e_loguru}. Falling back to standard logging.")
     logging.basicConfig(
         level=_log_level_to_use,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         force=True 
     )
-    logger = logging.getLogger(__name__)
-    _is_loguru = False
+    final_logger = logging.getLogger(settings.SERVICE_NAME) # Use a named standard logger
 
+# Quieten noisy libraries using the standard logging module's functions
+# This block will execute regardless of Loguru's success, and 'logging' is now guaranteed to be imported.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logging.getLogger("asyncpg").setLevel(logging.WARNING)
@@ -117,8 +119,12 @@ logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 logging.getLogger("PIL.PngImagePlugin").setLevel(logging.WARNING)
 
-logger.info(f"Configuration loaded for {settings.SERVICE_NAME}. Log level: {_log_level_to_use}. Using {'Loguru' if _is_loguru else 'standard logging'}.")
-logger.debug(f"BERTopic Model Filename: {settings.BERTOPIC_MODEL_FILENAME}")
-logger.debug(f"Derived BERTOPIC_MODEL_PATH after validation: {settings.BERTOPIC_MODEL_PATH}")
-logger.debug(f"Source PG: {settings.SOURCE_POSTGRES_DB}/{settings.SOURCE_POSTGRES_TABLE}")
-logger.debug(f"Target PG: {settings.TARGET_POSTGRES_DB}/{settings.TARGET_POSTGRES_TABLE}")
+if final_logger: # Check if logger was successfully initialized
+    final_logger.info(f"Configuration loaded for {settings.SERVICE_NAME}. Log level: {_log_level_to_use}. Using {'Loguru' if _is_loguru_configured else 'standard logging'}.")
+    final_logger.debug(f"BERTopic Model Filename: {settings.BERTOPIC_MODEL_FILENAME}")
+    final_logger.debug(f"Derived BERTOPIC_MODEL_PATH after validation: {settings.BERTOPIC_MODEL_PATH}")
+    final_logger.debug(f"Source PG: {settings.SOURCE_POSTGRES_DB}/{settings.SOURCE_POSTGRES_TABLE}")
+    final_logger.debug(f"Target PG: {settings.TARGET_POSTGRES_DB}/{settings.TARGET_POSTGRES_TABLE}")
+else:
+    # This case should ideally not be reached if basicConfig works
+    print(f"CRITICAL: Logger initialization failed for {settings.SERVICE_NAME}.")
