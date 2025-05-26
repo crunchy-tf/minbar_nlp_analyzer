@@ -3,7 +3,7 @@ from typing import List, Tuple, Optional, Dict, Any
 from bertopic import BERTopic
 from sentence_transformers import SentenceTransformer
 from loguru import logger
-import numpy as np # Import numpy for isinstance checks if probabilities are ndarray
+import numpy as np # Import numpy for isinstance checks
 
 from app.config import settings 
 
@@ -11,7 +11,7 @@ class TopicModeler:
     def __init__(self, model_path: str = settings.BERTOPIC_MODEL_PATH, sbert_model_name: str = settings.SBERT_MODEL_NAME):
         if not model_path or model_path == "dummy_path_will_be_overridden" or model_path == "derivation_failed_path":
             logger.critical(f"TopicModeler init: BERTOPIC_MODEL_PATH is invalid ('{model_path}'). BERTopic model will not be loaded.")
-            self.model_path = None # Ensure path is None if invalid
+            self.model_path = None 
         else:
             self.model_path = model_path
             
@@ -19,16 +19,15 @@ class TopicModeler:
         self.topic_model: Optional[BERTopic] = None
         self.embedding_model_instance: Optional[SentenceTransformer] = None
 
-        self._load_embedding_model() # Load SBERT model first
+        self._load_embedding_model() 
         
-        if self.model_path: # Only attempt to load BERTopic if path is valid
-            self._load_model()           # Then load BERTopic model, passing the SBERT instance
+        if self.model_path: 
+            self._load_model()          
         else:
             logger.error("Skipping BERTopic model loading due to invalid or unconfigured model_path.")
 
 
     def _load_embedding_model(self):
-        """Loads the SentenceTransformer model."""
         if not self.sbert_model_name:
             logger.error("SBERT_MODEL_NAME not configured. Cannot load embedding model for TopicModeler.")
             return
@@ -41,7 +40,6 @@ class TopicModeler:
             self.embedding_model_instance = None
 
     def _load_model(self):
-        """Loads the BERTopic model, providing the pre-loaded SBERT model."""
         if not self.embedding_model_instance:
             logger.error("SBERT embedding model instance is not available. Cannot effectively load BERTopic model for new predictions.")
             return 
@@ -62,7 +60,10 @@ class TopicModeler:
                 if hasattr(self.topic_model, 'embedding_model') and self.topic_model.embedding_model is not None:
                     logger.info(f"BERTopic has an embedding_model attribute. Type: {type(self.topic_model.embedding_model)}")
                     logger.info(f"Is it the same instance as self.embedding_model_instance? {self.topic_model.embedding_model is self.embedding_model_instance}")
-                    # No longer check for 'encode' directly on self.topic_model.embedding_model here
+                    if isinstance(self.topic_model.embedding_model, SentenceTransformer):
+                        logger.info("self.topic_model.embedding_model IS a SentenceTransformer instance.")
+                    else:
+                        logger.warning(f"self.topic_model.embedding_model IS NOT a SentenceTransformer instance. Actual type: {type(self.topic_model.embedding_model)}")
                 else:
                     logger.warning("BERTopic model loaded, but its internal embedding_model attribute is missing or None.")
             else:
@@ -80,15 +81,11 @@ class TopicModeler:
             logger.error("BERTopic model not loaded. Cannot get topics.")
             return None
         
-        # Ensure the internal embedding_model (backend wrapper) exists.
-        # BERTopic's .transform() will use this internal backend.
-        if not hasattr(self.topic_model, 'embedding_model') or self.topic_model.embedding_model is None:
+        current_embedding_model_backend = getattr(self.topic_model, 'embedding_model', None)
+        if current_embedding_model_backend is None:
             logger.error("BERTopic's internal embedding_model (backend wrapper) is missing. Cannot perform transform.")
             return None
             
-        # The direct 'encode' check on self.topic_model.embedding_model was removed.
-        # We trust BERTopic's transform to use its backend.
-
         if not document_text or not document_text.strip(): 
             logger.warning("Empty input text for topic modeling. Assigning to outlier topic.")
             return ([-1], [1.0]) 
@@ -98,19 +95,30 @@ class TopicModeler:
             topics, probabilities = self.topic_model.transform([document_text]) 
             logger.debug(f"BERTopic transform result - Topics: {topics}, Probabilities: {probabilities}")
             
-            if topics is None: 
+            # --- CORRECTED/REFINED CHECKS FOR TOPICS ---
+            if topics is None:
                 logger.error("BERTopic transform returned None for topics list.")
                 return None
-            # Ensure topics is a list and its first element is an int (if not empty)
-            if not isinstance(topics, list) or (topics and not isinstance(topics[0], int)):
-                 logger.error(f"BERTopic transform returned unexpected type/content for topics: {type(topics)}, value: {topics}")
+
+            is_valid_topics_format = False
+            if isinstance(topics, list):
+                if not topics: # Empty list is valid (though unusual for single doc if not outlier)
+                    is_valid_topics_format = True
+                elif isinstance(topics[0], (int, np.integer)): # Check for Python int or any NumPy integer
+                    is_valid_topics_format = True
+            
+            if not is_valid_topics_format:
+                 logger.error(f"BERTopic transform returned unexpected format for topics. Expected list of integers. Got type: {type(topics)}, value: {topics}")
+                 if isinstance(topics, list) and len(topics) > 0:
+                     logger.error(f"Type of topics[0]: {type(topics[0])}")
                  return None
+            # --- END CORRECTED CHECKS FOR TOPICS ---
 
             if probabilities is not None:
                 if not isinstance(probabilities, (list, np.ndarray)):
                     logger.warning(f"BERTopic transform returned unexpected type for probabilities: {type(probabilities)}. Proceeding cautiously.")
-                elif isinstance(probabilities, list): # Further check if it's a list of numbers/None or ndarrays
-                    if not all(isinstance(p, (float, int, type(None))) or (isinstance(p, np.ndarray) and p.size==1) for p in probabilities):
+                elif isinstance(probabilities, list): 
+                    if not all(isinstance(p, (float, int, type(None))) or (isinstance(p, np.ndarray) and p.size==1 and isinstance(p.item(), (float,int))) for p in probabilities):
                         logger.warning(f"BERTopic transform returned list of probabilities with unexpected element types: {[type(p) for p in probabilities]}.")
             
             return topics, probabilities
