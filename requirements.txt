@@ -1,9 +1,9 @@
 fastapi==0.104.1
 uvicorn[standard]==0.23.2
 loguru==0.7.2
-pydantic==2.5.2 # Often good to pin this with FastAPI
-pydantic==2.5.2a
-asyncpg==0.29.0    
+pydantic==2.5.2
+pydantic-settings==2.2.1
+asyncpg==0.29.0
 
 # --- Core dependencies - PINNED TO MATCH NEW PRETRAINING ENV ---
 sentence-transformers==2.7.0
@@ -16,11 +16,11 @@ hdbscan==0.8.33
 joblib==1.3.2
 
 # --- Dependencies for Transformers/Sentiment ---
-transformers[torch]==4.35.2 # Pinning transformers
+transformers[torch]==4.35.2
 torch==2.1.2 --index-url https://download.pytorch.org/whl/cpu
 sentencepiece==0.1.99
 protobuf==4.25.1
 
 # --- Other dependencies ---
 yake==0.4.8
-apscheduler==3.10.4 # Pinning this too
+apscheduler==3.10.4
