@@ -2,6 +2,8 @@ fastapi==0.104.1
 uvicorn[standard]==0.23.2
 loguru==0.7.2
 pydantic==2.5.2 # Often good to pin this with FastAPI
+pydantic-settings
+
 
 # --- Core dependencies - PINNED TO MATCH NEW PRETRAINING ENV ---
 sentence-transformers==2.7.0
